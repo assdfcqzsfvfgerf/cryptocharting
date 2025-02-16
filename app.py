@@ -8,8 +8,7 @@ from datetime import datetime, timedelta
 from ta.trend import SMAIndicator, EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
-from ta.volume import VolumeWeightedAveragePrice
-import talib
+from ta.volume import VolumeWeightedAveragePrice, OnBalanceVolumeIndicator
 from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -17,7 +16,7 @@ from textblob import TextBlob
 import requests
 from bs4 import BeautifulSoup
 import nltk
-nltk.download('punkt')
+nltk.download('punkt', quiet=True)
 
 def fetch_crypto_data(symbol, start_date, end_date):
     data = yf.download(f"{symbol}-USD", start=start_date, end=end_date)
@@ -34,10 +33,21 @@ def calculate_indicators(data):
     bb = BollingerBands(data['Close'])
     data['BB_upper'] = bb.bollinger_hband()
     data['BB_lower'] = bb.bollinger_lband()
-    data['MACD'] = talib.MACD(data['Close'])[0]
-    data['MACD_signal'] = talib.MACD(data['Close'])[1]
-    data['ATR'] = talib.ATR(data['High'], data['Low'], data['Close'])
-    data['OBV'] = talib.OBV(data['Close'], data['Volume'])
+    
+    # MACD
+    data['EMA_12'] = EMAIndicator(data['Close'], window=12).ema_indicator()
+    data['EMA_26'] = EMAIndicator(data['Close'], window=26).ema_indicator()
+    data['MACD'] = data['EMA_12'] - data['EMA_26']
+    data['MACD_signal'] = EMAIndicator(data['MACD'], window=9).ema_indicator()
+    
+    # ATR (Average True Range)
+    data['TR'] = np.maximum(data['High'] - data['Low'], 
+                            np.maximum(abs(data['High'] - data['Close'].shift()), 
+                                       abs(data['Low'] - data['Close'].shift())))
+    data['ATR'] = data['TR'].rolling(window=14).mean()
+    
+    # OBV (On-Balance Volume)
+    data['OBV'] = OnBalanceVolumeIndicator(data['Close'], data['Volume']).on_balance_volume()
 
     return data
 
