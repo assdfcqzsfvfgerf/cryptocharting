@@ -1,282 +1,338 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import ta
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from ta.trend import SMAIndicator, EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
-from ta.volume import VolumeWeightedAveragePrice, OnBalanceVolumeIndicator
+from scipy.signal import argrelextrema
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from textblob import TextBlob
+import json
+import os
 import requests
-from bs4 import BeautifulSoup
-import nltk
-nltk.download('punkt', quiet=True)
+from textblob import TextBlob
+import ccxt
+from concurrent.futures import ThreadPoolExecutor
 
-def fetch_crypto_data(symbol, start_date, end_date):
-    data = yf.download(f"{symbol}-USD", start=start_date, end=end_date)
-    return data
+class MLPredictor:
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=100)
+        self.scaler = StandardScaler()
+        
+    def prepare_features(self, df):
+        """Prepare features for ML model"""
+        features = pd.DataFrame()
+        
+        # Price-based features
+        features['price_change'] = df['Close'].pct_change()
+        features['price_volatility'] = df['Close'].rolling(window=20).std()
+        
+        # Volume features
+        features['volume_change'] = df['Volume'].pct_change()
+        features['volume_ma_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
+        
+        # Technical indicators
+        features['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
+        features['macd'] = ta.trend.MACD(df['Close']).macd()
+        
+        # Remove NaN values
+        features = features.dropna()
+        
+        return features
+        
+    def prepare_labels(self, df):
+        """Prepare labels for ML model (1 for price increase, 0 for decrease)"""
+        return (df['Close'].shift(-1) > df['Close']).astype(int)[:-1]
+        
+    def train(self, df):
+        """Train the ML model"""
+        features = self.prepare_features(df)
+        labels = self.prepare_labels(df)
+        
+        # Scale features
+        scaled_features = self.scaler.fit_transform(features)
+        
+        # Train model
+        self.model.fit(scaled_features[:-1], labels)
+        
+    def predict(self, df):
+        """Make predictions"""
+        features = self.prepare_features(df)
+        scaled_features = self.scaler.transform(features)
+        return self.model.predict_proba(scaled_features)
 
-def calculate_indicators(data):
-    # Basic indicators
-    data['SMA_20'] = SMAIndicator(data['Close'], window=20).sma_indicator()
-    data['EMA_20'] = EMAIndicator(data['Close'], window=20).ema_indicator()
-    data['RSI'] = RSIIndicator(data['Close']).rsi()
-    data['VWAP'] = VolumeWeightedAveragePrice(data['High'], data['Low'], data['Close'], data['Volume']).volume_weighted_average_price()
+class Backtester:
+    def __init__(self, initial_capital=10000):
+        self.initial_capital = initial_capital
+        
+    def simple_moving_average_strategy(self, df, short_window=20, long_window=50):
+        """Simple moving average crossover strategy"""
+        df['SMA_short'] = df['Close'].rolling(window=short_window).mean()
+        df['SMA_long'] = df['Close'].rolling(window=long_window).mean()
+        
+        # Generate signals
+        df['Signal'] = 0
+        df.loc[df['SMA_short'] > df['SMA_long'], 'Signal'] = 1
+        df.loc[df['SMA_short'] < df['SMA_long'], 'Signal'] = -1
+        
+        # Calculate returns
+        df['Returns'] = df['Close'].pct_change()
+        df['Strategy_Returns'] = df['Signal'].shift(1) * df['Returns']
+        
+        # Calculate cumulative returns
+        df['Cumulative_Market_Returns'] = (1 + df['Returns']).cumprod()
+        df['Cumulative_Strategy_Returns'] = (1 + df['Strategy_Returns']).cumprod()
+        
+        return df
+        
+    def calculate_metrics(self, df):
+        """Calculate backtest metrics"""
+        strategy_returns = df['Strategy_Returns'].dropna()
+        
+        metrics = {
+            'Total Return': f"{(df['Cumulative_Strategy_Returns'].iloc[-1] - 1) * 100:.2f}%",
+            'Annual Return': f"{(df['Cumulative_Strategy_Returns'].iloc[-1] - 1) * 365/len(df) * 100:.2f}%",
+            'Sharpe Ratio': f"{np.sqrt(252) * strategy_returns.mean() / strategy_returns.std():.2f}",
+            'Max Drawdown': f"{(df['Cumulative_Strategy_Returns'].cummax() - df['Cumulative_Strategy_Returns']).max() * 100:.2f}%"
+        }
+        
+        return metrics
 
-    # Advanced indicators
-    bb = BollingerBands(data['Close'])
-    data['BB_upper'] = bb.bollinger_hband()
-    data['BB_lower'] = bb.bollinger_lband()
-    
-    # MACD
-    data['EMA_12'] = EMAIndicator(data['Close'], window=12).ema_indicator()
-    data['EMA_26'] = EMAIndicator(data['Close'], window=26).ema_indicator()
-    data['MACD'] = data['EMA_12'] - data['EMA_26']
-    data['MACD_signal'] = EMAIndicator(data['MACD'], window=9).ema_indicator()
-    
-    # ATR (Average True Range)
-    data['TR'] = np.maximum(data['High'] - data['Low'], 
-                            np.maximum(abs(data['High'] - data['Close'].shift()), 
-                                       abs(data['Low'] - data['Close'].shift())))
-    data['ATR'] = data['TR'].rolling(window=14).mean()
-    
-    # OBV (On-Balance Volume)
-    data['OBV'] = OnBalanceVolumeIndicator(data['Close'], data['Volume']).on_balance_volume()
+class SentimentAnalyzer:
+    def __init__(self):
+        self.api_key = os.getenv('NEWS_API_KEY', '')
+        
+    def fetch_news(self, crypto):
+        """Fetch news articles about cryptocurrency"""
+        url = f"https://newsapi.org/v2/everything?q={crypto}&apiKey={self.api_key}"
+        try:
+            response = requests.get(url)
+            return response.json()['articles']
+        except:
+            return []
+            
+    def analyze_sentiment(self, text):
+        """Analyze sentiment of text using TextBlob"""
+        return TextBlob(text).sentiment.polarity
+        
+    def get_overall_sentiment(self, crypto):
+        """Get overall sentiment from news articles"""
+        articles = self.fetch_news(crypto)
+        if not articles:
+            return 0
+            
+        sentiments = [self.analyze_sentiment(article['title'] + ' ' + article['description'])
+                     for article in articles]
+        return np.mean(sentiments)
 
-    return data
-
-def detect_patterns_ml(data, n_clusters=5):
-    # Prepare features for clustering
-    features = data[['Open', 'High', 'Low', 'Close', 'Volume']].values
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(features)
-
-    # Perform K-means clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-    data['Cluster'] = kmeans.fit_predict(scaled_features)
-
-    # Identify pattern changes
-    data['Pattern_Change'] = data['Cluster'].diff() != 0
-
-    return data
-
-def simple_pattern_detection(data, window=20):
-    # Detect local maxima and minima
-    data['Local_Max'] = data['High'].rolling(window=window, center=True).max() == data['High']
-    data['Local_Min'] = data['Low'].rolling(window=window, center=True).min() == data['Low']
-    
-    # Combine with cluster-based pattern changes
-    data['Pattern_Change'] = data['Pattern_Change'] | data['Local_Max'] | data['Local_Min']
-    
-    return data
-
-def backtest_strategy(data, strategy_func):
-    # Implement a simple backtesting framework
-    data['Signal'] = strategy_func(data)
-    data['Returns'] = data['Close'].pct_change()
-    data['Strategy_Returns'] = data['Signal'].shift(1) * data['Returns']
-    
-    # Calculate performance metrics
-    cumulative_returns = (1 + data['Strategy_Returns']).cumprod()
-    total_return = cumulative_returns.iloc[-1] - 1
-    sharpe_ratio = np.sqrt(252) * data['Strategy_Returns'].mean() / data['Strategy_Returns'].std()
-    
-    return {
-        'Cumulative_Returns': cumulative_returns,
-        'Total_Return': total_return,
-        'Sharpe_Ratio': sharpe_ratio
-    }
-
-def simple_moving_average_crossover(data):
-    # Example strategy: Buy when short-term SMA crosses above long-term SMA, sell when it crosses below
-    data['SMA_short'] = data['Close'].rolling(window=10).mean()
-    data['SMA_long'] = data['Close'].rolling(window=50).mean()
-    return np.where(data['SMA_short'] > data['SMA_long'], 1, 0)
-
-def fetch_news_sentiment(symbol, num_articles=5):
-    # Fetch recent news articles
-    url = f"https://cryptonews.com/news/bitcoin-news/"  # Replace with an appropriate news source
-    response = requests.get(url)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    articles = soup.find_all('div', class_='cn-tile article')
-
-    sentiments = []
-    for article in articles[:num_articles]:
-        title = article.find('h4', class_='cn-tile-header').text
-        blob = TextBlob(title)
-        sentiment = blob.sentiment.polarity
-        sentiments.append(sentiment)
-
-    return np.mean(sentiments)
-
-def calculate_portfolio_value(holdings, current_prices):
-    return sum(holdings[symbol] * current_prices[symbol] for symbol in holdings)
-
-def create_candlestick_chart(data, symbol, indicators, volume_profile, patterns):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-
-    # Candlestick chart
-    fig.add_trace(go.Candlestick(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name=symbol
-    ), row=1, col=1)
-
-    # Add indicators
-    for indicator in indicators:
-        fig.add_trace(go.Scatter(
-            x=data.index,
-            y=data[indicator],
-            name=indicator,
-            line=dict(color=next(fig._color_cycle))
-        ), row=1, col=1)
-
-    # Add volume profile
-    if volume_profile is not None:
-        fig.add_trace(go.Bar(
-            x=volume_profile.values,
-            y=volume_profile.index.mid,
-            orientation='h',
-            name='Volume Profile',
-            marker=dict(color='rgba(0,0,255,0.2)'),
-            showlegend=False
-        ), row=1, col=1)
-
-    # Add detected patterns
-    pattern_changes = data[data['Pattern_Change']]
-    fig.add_trace(go.Scatter(
-        x=pattern_changes.index,
-        y=pattern_changes['Close'],
-        mode='markers',
-        marker=dict(symbol='star', size=10, color='red'),
-        name='Pattern Change'
-    ), row=1, col=1)
-
-    # Add volume bars
-    colors = ['green' if data['Close'][i] > data['Open'][i] else 'red' for i in range(len(data))]
-    fig.add_trace(go.Bar(
-        x=data.index,
-        y=data['Volume'],
-        name='Volume',
-        marker=dict(color=colors)
-    ), row=2, col=1)
-
-    fig.update_layout(
-        title=f"{symbol} Price Chart",
-        xaxis_title="Date",
-        yaxis_title="Price (USD)",
-        xaxis_rangeslider_visible=False
-    )
-
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
-
-    return fig
+class PortfolioTracker:
+    def __init__(self):
+        self.exchange = ccxt.binance()
+        
+    def load_portfolio(self):
+        """Load portfolio from storage"""
+        if os.path.exists('portfolio.json'):
+            with open('portfolio.json', 'r') as f:
+                return json.load(f)
+        return {}
+        
+    def save_portfolio(self, portfolio):
+        """Save portfolio to storage"""
+        with open('portfolio.json', 'w') as f:
+            json.dump(portfolio, f)
+            
+    def calculate_portfolio_value(self, portfolio):
+        """Calculate current portfolio value"""
+        total_value = 0
+        for crypto, amount in portfolio.items():
+            try:
+                ticker = self.exchange.fetch_ticker(f"{crypto}/USDT")
+                price = ticker['last']
+                value = float(amount) * price
+                total_value += value
+            except:
+                continue
+        return total_value
+        
+    def get_portfolio_stats(self, portfolio):
+        """Get portfolio statistics"""
+        stats = {}
+        total_value = self.calculate_portfolio_value(portfolio)
+        
+        for crypto, amount in portfolio.items():
+            try:
+                ticker = self.exchange.fetch_ticker(f"{crypto}/USDT")
+                price = ticker['last']
+                value = float(amount) * price
+                stats[crypto] = {
+                    'amount': amount,
+                    'value': value,
+                    'percentage': (value / total_value) * 100 if total_value > 0 else 0
+                }
+            except:
+                continue
+                
+        return stats
 
 def main():
-    st.set_page_config(page_title="Advanced Crypto Analysis App", layout="wide")
-    st.title("Advanced Cryptocurrency Analysis App")
+    st.set_page_config(layout="wide")
+    st.title("Advanced Cryptocurrency Trading Dashboard")
 
-    # Sidebar for user input
-    st.sidebar.header("Settings")
-    crypto_symbols = st.sidebar.multiselect("Select Cryptocurrencies", ["BTC", "ETH", "XRP", "LTC", "ADA"], default=["BTC"])
-    
-    # Date range selector
-    col1, col2 = st.sidebar.columns(2)
-    start_date = col1.date_input("Start Date", datetime.now() - timedelta(days=365))
-    end_date = col2.date_input("End Date", datetime.now())
+    # Initialize components
+    ml_predictor = MLPredictor()
+    backtester = Backtester()
+    sentiment_analyzer = SentimentAnalyzer()
+    portfolio_tracker = PortfolioTracker()
 
-    # Indicator selection
-    st.sidebar.subheader("Indicators")
-    selected_indicators = st.sidebar.multiselect("Select Indicators", 
-                                                 ['SMA_20', 'EMA_20', 'RSI', 'VWAP', 'BB_upper', 'BB_lower', 'MACD', 'ATR', 'OBV'],
-                                                 default=['SMA_20', 'EMA_20', 'RSI'])
+    # Tabs for different features
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Market Analysis", 
+        "ML Predictions", 
+        "Backtesting", 
+        "Sentiment Analysis",
+        "Portfolio Tracking"
+    ])
 
-    # Portfolio tracking
-    st.sidebar.subheader("Portfolio Tracking")
-    portfolio = {}
-    for symbol in crypto_symbols:
-        portfolio[symbol] = st.sidebar.number_input(f"{symbol} Holdings", min_value=0.0, value=0.0, step=0.1)
+    # Market Analysis Tab
+    with tab1:
+        crypto_symbols = ['BTC', 'ETH', 'DOGE', 'ADA', 'DOT', 'SOL', 'MATIC', 'LINK']
+        selected_crypto = st.selectbox("Select Cryptocurrency", crypto_symbols)
+        
+        timeframe = st.selectbox(
+            "Select Timeframe",
+            ["1 Day", "1 Week", "1 Month", "3 Months", "6 Months", "1 Year", "YTD"]
+        )
 
-    # Fetch data and calculate indicators for all selected cryptocurrencies
-    all_data = {}
-    for symbol in crypto_symbols:
-        data = fetch_crypto_data(symbol, start_date, end_date)
-        data = calculate_indicators(data)
-        data = detect_patterns_ml(data)
-        data = simple_pattern_detection(data)
-        all_data[symbol] = data
+        # Fetch data
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days={
+            "1 Day": 1, "1 Week": 7, "1 Month": 30, "3 Months": 90,
+            "6 Months": 180, "1 Year": 365, "YTD": (end_date - datetime(end_date.year, 1, 1)).days
+        }[timeframe])
 
-    # Create tabs
-    tabs = st.tabs(["Price Analysis"] + crypto_symbols + ["Portfolio", "Backtesting", "Sentiment Analysis"])
+        df = yf.download(f"{selected_crypto}-USD", start=start_date, end=end_date)
 
-    with tabs[0]:
-        st.subheader("Multi-Currency Price Analysis")
-        fig = go.Figure()
-        for symbol, data in all_data.items():
-            fig.add_trace(go.Scatter(x=data.index, y=data['Close'], name=f"{symbol} Close Price"))
-        fig.update_layout(title="Comparative Price Analysis", xaxis_title="Date", yaxis_title="Price (USD)")
+        # Display main chart
+        fig = go.Figure(data=[go.Candlestick(x=df.index,
+                                            open=df['Open'],
+                                            high=df['High'],
+                                            low=df['Low'],
+                                            close=df['Close'])])
         st.plotly_chart(fig, use_container_width=True)
 
-    # Individual cryptocurrency tabs
-    for i, symbol in enumerate(crypto_symbols, start=1):
-        with tabs[i]:
-            st.subheader(f"{symbol} Analysis")
-            data = all_data[symbol]
-            chart = create_candlestick_chart(data, symbol, selected_indicators, None, None)
-            st.plotly_chart(chart, use_container_width=True)
+    # ML Predictions Tab
+    with tab2:
+        st.subheader("Machine Learning Predictions")
+        
+        if st.button("Train Model"):
+            with st.spinner("Training ML model..."):
+                ml_predictor.train(df)
+            
+            predictions = ml_predictor.predict(df)
+            
+            st.write("Probability of price increase:", f"{predictions[-1][1]:.2%}")
+            st.write("Probability of price decrease:", f"{predictions[-1][0]:.2%}")
+            
+            # Feature importance
+            feature_importance = pd.DataFrame({
+                'Feature': ml_predictor.prepare_features(df).columns,
+                'Importance': ml_predictor.model.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            
+            st.write("Feature Importance:")
+            st.bar_chart(feature_importance.set_index('Feature'))
 
-            # Display additional analysis
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Technical Indicators")
-                st.write(data[selected_indicators].tail())
-            with col2:
-                st.subheader("Pattern Recognition")
-                st.write(f"Number of detected patterns: {data['Pattern_Change'].sum()}")
-
-    # Portfolio tab
-    with tabs[-3]:
-        st.subheader("Portfolio Analysis")
-        current_prices = {symbol: data['Close'].iloc[-1] for symbol, data in all_data.items()}
-        portfolio_value = calculate_portfolio_value(portfolio, current_prices)
-        st.write(f"Total Portfolio Value: ${portfolio_value:.2f}")
-
-        # Portfolio composition pie chart
-        fig = go.Figure(data=[go.Pie(labels=list(portfolio.keys()), 
-                                     values=[portfolio[symbol] * current_prices[symbol] for symbol in portfolio])])
-        fig.update_layout(title="Portfolio Composition")
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Backtesting tab
-    with tabs[-2]:
+    # Backtesting Tab
+    with tab3:
         st.subheader("Strategy Backtesting")
-        selected_symbol = st.selectbox("Select Cryptocurrency for Backtesting", crypto_symbols)
-        backtest_results = backtest_strategy(all_data[selected_symbol], simple_moving_average_crossover)
-
-        st.write(f"Total Return: {backtest_results['Total_Return']:.2%}")
-        st.write(f"Sharpe Ratio: {backtest_results['Sharpe_Ratio']:.2f}")
-
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            short_window = st.slider("Short MA Window", 5, 50, 20)
+        with col2:
+            long_window = st.slider("Long MA Window", 20, 200, 50)
+            
+        backtest_results = backtester.simple_moving_average_strategy(
+            df.copy(), 
+            short_window=short_window, 
+            long_window=long_window
+        )
+        
+        metrics = backtester.calculate_metrics(backtest_results)
+        
+        # Display metrics
+        for metric, value in metrics.items():
+            st.metric(metric, value)
+            
+        # Plot strategy returns
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=backtest_results['Cumulative_Returns'].index, 
-                                 y=backtest_results['Cumulative_Returns'], 
-                                 name="Strategy Returns"))
-        fig.update_layout(title="Backtesting Results", xaxis_title="Date", yaxis_title="Cumulative Returns")
+        fig.add_trace(go.Scatter(
+            x=backtest_results.index,
+            y=backtest_results['Cumulative_Market_Returns'],
+            name="Market Returns"
+        ))
+        fig.add_trace(go.Scatter(
+            x=backtest_results.index,
+            y=backtest_results['Cumulative_Strategy_Returns'],
+            name="Strategy Returns"
+        ))
         st.plotly_chart(fig, use_container_width=True)
 
-    # Sentiment Analysis tab
-    with tabs[-1]:
-        st.subheader("Sentiment Analysis")
-        for symbol in crypto_symbols:
-            sentiment = fetch_news_sentiment(symbol)
-            st.write(f"{symbol} Sentiment Score: {sentiment:.2f}")
+    # Sentiment Analysis Tab
+    with tab4:
+        st.subheader("Market Sentiment Analysis")
+        
+        sentiment = sentiment_analyzer.get_overall_sentiment(selected_crypto)
+        
+        # Display sentiment gauge
+        fig = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = sentiment,
+            domain = {'x': [0, 1], 'y': [0, 1]},
+            gauge = {
+                'axis': {'range': [-1, 1]},
+                'steps': [
+                    {'range': [-1, -0.3], 'color': "red"},
+                    {'range': [-0.3, 0.3], 'color': "gray"},
+                    {'range': [0.3, 1], 'color': "green"}
+                ]
+            }
+        ))
+        st.plotly_chart(fig)
+
+    # Portfolio Tracking Tab
+    with tab5:
+        st.subheader("Portfolio Tracker")
+        
+        portfolio = portfolio_tracker.load_portfolio()
+        
+        # Add new position
+        col1, col2 = st.columns(2)
+        with col1:
+            new_crypto = st.selectbox("Cryptocurrency", crypto_symbols)
+            new_amount = st.number_input("Amount", min_value=0.0)
+            
+        if st.button("Add Position"):
+            portfolio[new_crypto] = new_amount
+            portfolio_tracker.save_portfolio(portfolio)
+            
+        # Display portfolio
+        if portfolio:
+            stats = portfolio_tracker.get_portfolio_stats(portfolio)
+            
+            # Portfolio pie chart
+            fig = go.Figure(data=[go.Pie(
+                labels=list(stats.keys()),
+                values=[stat['value'] for stat in stats.values()]
+            )])
+            st.plotly_chart(fig)
+            
+            # Portfolio table
+            st.write("Portfolio Breakdown:")
+            portfolio_df = pd.DataFrame.from_dict(stats, orient='index')
+            st.dataframe(portfolio_df)
 
 if __name__ == "__main__":
     main()
