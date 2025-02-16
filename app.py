@@ -9,7 +9,6 @@ from ta.trend import SMAIndicator, EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 from ta.volume import VolumeWeightedAveragePrice, OnBalanceVolumeIndicator
-from scipy.signal import find_peaks
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from textblob import TextBlob
