@@ -66,6 +66,16 @@ def detect_patterns_ml(data, n_clusters=5):
 
     return data
 
+def simple_pattern_detection(data, window=20):
+    # Detect local maxima and minima
+    data['Local_Max'] = data['High'].rolling(window=window, center=True).max() == data['High']
+    data['Local_Min'] = data['Low'].rolling(window=window, center=True).min() == data['Low']
+    
+    # Combine with cluster-based pattern changes
+    data['Pattern_Change'] = data['Pattern_Change'] | data['Local_Max'] | data['Local_Min']
+    
+    return data
+
 def backtest_strategy(data, strategy_func):
     # Implement a simple backtesting framework
     data['Signal'] = strategy_func(data)
@@ -141,7 +151,7 @@ def create_candlestick_chart(data, symbol, indicators, volume_profile, patterns)
             showlegend=False
         ), row=1, col=1)
 
-    # Add ML-detected patterns
+    # Add detected patterns
     pattern_changes = data[data['Pattern_Change']]
     fig.add_trace(go.Scatter(
         x=pattern_changes.index,
@@ -202,6 +212,7 @@ def main():
         data = fetch_crypto_data(symbol, start_date, end_date)
         data = calculate_indicators(data)
         data = detect_patterns_ml(data)
+        data = simple_pattern_detection(data)
         all_data[symbol] = data
 
     # Create tabs
